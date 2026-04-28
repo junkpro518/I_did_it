@@ -1,0 +1,14 @@
+services:
+  bot:
+    build: .
+    container_name: i_did_it_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TIMEZONE:-Asia/Riyadh}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
