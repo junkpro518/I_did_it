@@ -25,6 +25,7 @@ class Config:
     telegram_chat_id: int | None
     notion_token: str
     notion_database_id: str
+    notion_log_database_id: str
 
     notion_title_property: str
     notion_date_property: str
@@ -56,6 +57,7 @@ def load_config() -> Config:
         telegram_chat_id=chat_id,
         notion_token=_required("NOTION_TOKEN"),
         notion_database_id=_required("NOTION_DATABASE_ID"),
+        notion_log_database_id=_required("NOTION_LOG_DATABASE_ID"),
 
         notion_title_property=os.getenv("NOTION_TITLE_PROPERTY", "Name"),
         notion_date_property=os.getenv("NOTION_DATE_PROPERTY", "Date"),

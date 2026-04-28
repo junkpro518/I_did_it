@@ -18,7 +18,7 @@ from datetime import date
 from telegram import Bot, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
 
 from .config import Config
-from .notion_client import NotionTasks, Task
+from .notion_client import LogEntry, NotionTasks
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class AnswerType(ABC):
     name: str  # canonical name (matches a Notion `Type` Select option)
 
     @abstractmethod
-    def prompt(self, task: Task) -> str:
+    def prompt(self, task: LogEntry) -> str:
         """Question text shown above the keyboard."""
 
     @abstractmethod
@@ -76,8 +76,8 @@ class AnswerType(ABC):
             await ctx.notion.update_status(page_id, ctx.cfg.status_missed)
             return f"❌ {original}"
         if action == ACTION_POSTPONE:
-            await ctx.notion.postpone_to_tomorrow(page_id, ctx.today)
-            return f"⏭️ {original} (أُجِّلت لبكرة)"
+            await ctx.notion.update_status(page_id, ctx.cfg.status_postponed)
+            return f"⏭️ {original} (أُجِّلت)"
         raise ValueError(f"Unknown action {action!r} for type {self.name!r}")
 
     async def on_text(self, text: str, page_id: str, original: str, ctx: AnswerContext) -> str:
@@ -93,7 +93,7 @@ class BooleanAnswer(AnswerType):
     name = "Boolean"
     ACTION_DONE = "d"
 
-    def prompt(self, task: Task) -> str:
+    def prompt(self, task: LogEntry) -> str:
         return f"• {task.title}"
 
     def keyboard(self, page_id: str) -> InlineKeyboardMarkup:
@@ -126,7 +126,7 @@ class RatingAnswer(AnswerType):
     code = "r"
     name = "Rating"
 
-    def prompt(self, task: Task) -> str:
+    def prompt(self, task: LogEntry) -> str:
         return f"⭐ {task.title}\nقيّم من 1 إلى 5:"
 
     def keyboard(self, page_id: str) -> InlineKeyboardMarkup:
@@ -178,7 +178,7 @@ class NumberAnswer(_AskTextMixin, AnswerType):
     code = "n"
     name = "Number"
 
-    def prompt(self, task: Task) -> str:
+    def prompt(self, task: LogEntry) -> str:
         return f"🔢 {task.title}"
 
     def keyboard(self, page_id: str) -> InlineKeyboardMarkup:
@@ -223,7 +223,7 @@ class TextAnswer(_AskTextMixin, AnswerType):
     code = "t"
     name = "Text"
 
-    def prompt(self, task: Task) -> str:
+    def prompt(self, task: LogEntry) -> str:
         return f"📝 {task.title}"
 
     def keyboard(self, page_id: str) -> InlineKeyboardMarkup:
@@ -295,7 +295,7 @@ class _Registry:
             new_by_name[target.lower()] = at
         self._by_name = new_by_name
 
-    def for_task(self, task: Task) -> AnswerType:
+    def for_task(self, task: LogEntry) -> AnswerType:
         if task.type_value:
             at = self._by_name.get(task.type_value.lower())
             if at is not None:

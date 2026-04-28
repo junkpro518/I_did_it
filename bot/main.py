@@ -12,6 +12,10 @@ from .scheduler import setup_scheduler
 
 BOT_COMMANDS = [
     BotCommand("tasks", "مراجعة مهام اليوم الآن"),
+    BotCommand("add", "إضافة مهمة جديدة"),
+    BotCommand("list", "عرض كل المهام الدائمة"),
+    BotCommand("edit", "تعديل مهمة"),
+    BotCommand("delete", "حذف مهمة"),
     BotCommand("health", "حالة البوت و Notion"),
     BotCommand("start", "ترحيب وعرض Chat ID"),
 ]
