@@ -19,6 +19,19 @@ def _int(name: str, default: int) -> int:
     return int(raw)
 
 
+def _int_list(name: str, default: list[int]) -> list[int]:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    values: list[int] = []
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        values.append(int(value))
+    return values or default
+
+
 @dataclass(frozen=True)
 class Config:
     telegram_bot_token: str
@@ -31,6 +44,7 @@ class Config:
     notion_date_property: str
     notion_status_property: str
     notion_type_property: str
+    notion_days_property: str
     notion_value_property: str
     notion_note_property: str
 
@@ -44,8 +58,10 @@ class Config:
     type_text: str
 
     timezone: str
-    daily_hour: int
-    daily_minute: int
+    morning_hour: int
+    morning_minute: int
+    reminder_hours: list[int]
+    reminder_minute: int
 
 
 def load_config() -> Config:
@@ -63,6 +79,7 @@ def load_config() -> Config:
         notion_date_property=os.getenv("NOTION_DATE_PROPERTY", "Date"),
         notion_status_property=os.getenv("NOTION_STATUS_PROPERTY", "Status"),
         notion_type_property=os.getenv("NOTION_TYPE_PROPERTY", "Type"),
+        notion_days_property=os.getenv("NOTION_DAYS_PROPERTY", "Days"),
         notion_value_property=os.getenv("NOTION_VALUE_PROPERTY", "Value"),
         notion_note_property=os.getenv("NOTION_NOTE_PROPERTY", "Note"),
 
@@ -76,6 +93,8 @@ def load_config() -> Config:
         type_text=os.getenv("TYPE_TEXT", "Text"),
 
         timezone=os.getenv("TIMEZONE", "Asia/Riyadh"),
-        daily_hour=_int("DAILY_HOUR", 22),
-        daily_minute=_int("DAILY_MINUTE", 0),
+        morning_hour=_int("MORNING_HOUR", _int("DAILY_HOUR", 4)),
+        morning_minute=_int("MORNING_MINUTE", _int("DAILY_MINUTE", 0)),
+        reminder_hours=_int_list("REMINDER_HOURS", [16, 23]),
+        reminder_minute=_int("REMINDER_MINUTE", 0),
     )

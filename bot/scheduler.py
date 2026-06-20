@@ -17,33 +17,49 @@ log = logging.getLogger(__name__)
 def setup_scheduler(app: Application, cfg: Config, notion: NotionTasks) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(cfg.timezone))
 
-    async def daily_job() -> None:
+    async def send_job(heading: str) -> None:
         if cfg.telegram_chat_id is None:
-            log.warning("Skipping daily job: TELEGRAM_CHAT_ID is not set")
+            log.warning("Skipping scheduled job: TELEGRAM_CHAT_ID is not set")
             return
-        log.info("Running daily task review job")
+        log.info("Running scheduled task job: %s", heading)
         try:
-            count = await send_today_tasks(app, cfg.telegram_chat_id, cfg, notion)
+            count = await send_today_tasks(app, cfg.telegram_chat_id, cfg, notion, heading=heading)
             log.info("Sent %d tasks", count)
         except Exception:
-            log.exception("Daily job failed")
+            log.exception("Scheduled job failed")
             try:
                 await app.bot.send_message(
                     chat_id=cfg.telegram_chat_id,
-                    text="⚠️ فشل التذكير اليومي. تحقق من logs.",
+                    text="⚠️ فشل التذكير المجدول. تحقق من logs.",
                 )
             except Exception:
                 log.exception("Could not even send error notification")
 
-    job = scheduler.add_job(
-        daily_job,
+    morning_job = scheduler.add_job(
+        send_job,
         trigger=CronTrigger(
-            hour=cfg.daily_hour,
-            minute=cfg.daily_minute,
+            hour=cfg.morning_hour,
+            minute=cfg.morning_minute,
             timezone=ZoneInfo(cfg.timezone),
         ),
-        id="daily_task_review",
+        args=["🌅 صباح الخير. هذه قائمة مهامك لهذا اليوم:"],
+        id="morning_task_list",
         replace_existing=True,
     )
-    app.bot_data["scheduler_jobs"] = [job]
+    jobs = [morning_job]
+    for hour in cfg.reminder_hours:
+        jobs.append(
+            scheduler.add_job(
+                send_job,
+                trigger=CronTrigger(
+                    hour=hour,
+                    minute=cfg.reminder_minute,
+                    timezone=ZoneInfo(cfg.timezone),
+                ),
+                args=["⏰ تذكير: هذه المهام المفتوحة لليوم:"],
+                id=f"task_reminder_{hour:02d}_{cfg.reminder_minute:02d}",
+                replace_existing=True,
+            )
+        )
+    app.bot_data["scheduler_jobs"] = jobs
     return scheduler

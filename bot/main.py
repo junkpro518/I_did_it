@@ -12,6 +12,7 @@ from .scheduler import setup_scheduler
 
 BOT_COMMANDS = [
     BotCommand("tasks", "مراجعة مهام اليوم الآن"),
+    BotCommand("report", "تقرير التقدم والإحصائيات"),
     BotCommand("add", "إضافة مهمة جديدة"),
     BotCommand("list", "عرض كل المهام الدائمة"),
     BotCommand("edit", "تعديل مهمة"),
@@ -38,9 +39,11 @@ async def _post_init(app: Application) -> None:
     log.info("Registered %d commands in Telegram menu", len(BOT_COMMANDS))
 
     log.info(
-        "Scheduler started (daily at %02d:%02d %s, chat_id=%s)",
-        cfg.daily_hour,
-        cfg.daily_minute,
+        "Scheduler started (morning at %02d:%02d, reminders=%s:%02d %s, chat_id=%s)",
+        cfg.morning_hour,
+        cfg.morning_minute,
+        ",".join(f"{hour:02d}" for hour in cfg.reminder_hours),
+        cfg.reminder_minute,
         cfg.timezone,
         cfg.telegram_chat_id,
     )
