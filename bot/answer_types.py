@@ -24,7 +24,6 @@ log = logging.getLogger(__name__)
 
 # Common actions every type supports
 ACTION_MISSED = "m"
-ACTION_POSTPONE = "p"
 
 
 @dataclass
@@ -37,6 +36,7 @@ class AnswerContext:
     bot: Bot
     chat_id: int
     pending: dict  # mutated when a type asks for a follow-up text reply
+    original_message_id: int | None = None  # set so _ask can disable the triggering keyboard
 
 
 class AnswerType(ABC):
@@ -58,9 +58,6 @@ class AnswerType(ABC):
             InlineKeyboardButton(
                 "❌ لم يتم", callback_data=f"{self.code}:{ACTION_MISSED}:{page_id}"
             ),
-            InlineKeyboardButton(
-                "⏭️ بكرة", callback_data=f"{self.code}:{ACTION_POSTPONE}:{page_id}"
-            ),
         ]
 
     async def on_button(
@@ -75,9 +72,6 @@ class AnswerType(ABC):
         if action == ACTION_MISSED:
             await ctx.notion.update_status(page_id, ctx.cfg.status_missed)
             return f"❌ {original}"
-        if action == ACTION_POSTPONE:
-            await ctx.notion.update_status(page_id, ctx.cfg.status_postponed)
-            return f"⏭️ {original} (أُجِّلت)"
         raise ValueError(f"Unknown action {action!r} for type {self.name!r}")
 
     async def on_text(self, text: str, page_id: str, original: str, ctx: AnswerContext) -> str:
@@ -105,9 +99,6 @@ class BooleanAnswer(AnswerType):
                     ),
                     InlineKeyboardButton(
                         "❌ لم يتم", callback_data=f"{self.code}:{ACTION_MISSED}:{page_id}"
-                    ),
-                    InlineKeyboardButton(
-                        "⏭️ بكرة", callback_data=f"{self.code}:{ACTION_POSTPONE}:{page_id}"
                     ),
                 ]
             ]
@@ -145,6 +136,8 @@ class RatingAnswer(AnswerType):
                 await ctx.notion.update_value(page_id, value)
                 await ctx.notion.update_status(page_id, ctx.cfg.status_done)
                 return f"⭐ {original}\nالتقييم: {value}/5"
+            else:
+                raise ValueError(f"قيمة التقييم يجب أن تكون بين 1 و5، استُلم: {value}")
         return await super().on_button(action, page_id, original, ctx)
 
 
@@ -172,6 +165,17 @@ class _AskTextMixin:
             "page_id": page_id,
             "original": original,
         }
+        # Disable the original message's inline keyboard so the user cannot
+        # tap "Enter number" / "Enter text" again and create duplicate pending entries.
+        if ctx.original_message_id is not None:
+            try:
+                await ctx.bot.edit_message_reply_markup(
+                    chat_id=ctx.chat_id,
+                    message_id=ctx.original_message_id,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass  # best-effort, don't fail the flow
 
 
 class NumberAnswer(_AskTextMixin, AnswerType):

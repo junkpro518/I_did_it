@@ -10,6 +10,13 @@ services:
       TZ: ${TIMEZONE:-Asia/Riyadh}
     stop_grace_period: 30s
 
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    volumes:
+      - reminders_data:/app/data
+
     networks:
       - i_did_it_internal
 
@@ -28,3 +35,6 @@ services:
 networks:
   i_did_it_internal:
     driver: bridge
+
+volumes:
+  reminders_data:

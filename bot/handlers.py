@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import time
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -23,8 +24,9 @@ from telegram.ext import (
 
 from .answer_types import REGISTRY, AnswerContext, AnswerType
 from .config import Config
-from .days import format_days, parse_days
+from .days import DAY_LABELS, day_label, format_days, parse_days
 from .notion_client import LogEntry, NotionTasks
+from .reminders import Reminder, RemindersStore
 
 log = logging.getLogger(__name__)
 
@@ -43,8 +45,29 @@ def _authorized(update: Update, cfg: Config) -> bool:
     return chat is not None and chat.id == cfg.telegram_chat_id
 
 
-def _pending(app: Application) -> dict:
-    return app.bot_data.setdefault("pending_text", {})
+class _PendingDict(dict):
+    """dict subclass that auto-stamps entries with a creation timestamp."""
+
+    def __setitem__(self, key, value):
+        if isinstance(value, dict) and "ts" not in value:
+            value = dict(value, ts=time.time())
+        super().__setitem__(key, value)
+
+
+def _pending(app: Application) -> _PendingDict:
+    p = app.bot_data.get("pending_text")
+    if not isinstance(p, _PendingDict):
+        p = _PendingDict(p or {})
+        app.bot_data["pending_text"] = p
+    return p
+
+
+def _clean_pending(pending: _PendingDict) -> None:
+    """Remove entries older than 24 hours to prevent memory leaks."""
+    cutoff = time.time() - 86400
+    stale = [k for k, v in pending.items() if isinstance(v, dict) and v.get("ts", 0) < cutoff]
+    for k in stale:
+        del pending[k]
 
 
 def _ctx(app: Application, chat_id: int) -> AnswerContext:
@@ -99,7 +122,7 @@ async def send_today_tasks(
 
     await app.bot.send_message(
         chat_id=chat_id,
-        text=f"{heading}\nعندك {len(open_entries)} مهمة مفتوحة.",
+        text=f"{heading}\nعندك {len(open_entries)} مهمة مفتوحة من أصل {len(entries)}.",
     )
     for entry in open_entries:
         await _send_question(app, chat_id, entry)
@@ -127,7 +150,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "✅ البوت شغّال.\n\n"
         "/tasks — مراجعة مهام اليوم\n"
-        "/report — تقرير التقدم\n"
+        "/progress — تقدم مهام اليوم\n"
+        "/report — تقرير إحصائي\n"
+        "/reminder — إضافة تذكير\n"
+        "/reminders — قائمة التذكيرات\n"
+        "/delreminder — حذف تذكير\n"
+        "/add — إضافة مهمة جديدة\n"
+        "/list — عرض كل المهام الدائمة\n"
+        "/edit — تعديل مهمة\n"
+        "/delete — حذف مهمة\n"
+        "/health — فحص الاتصال"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _authorized(update, cfg) or update.message is None:
+        return
+    await update.message.reply_text(
+        "✅ البوت شغّال.\n\n"
+        "/tasks — مراجعة مهام اليوم\n"
+        "/progress — تقدم مهام اليوم\n"
+        "/report — تقرير إحصائي\n"
+        "/reminder — إضافة تذكير\n"
+        "/reminders — قائمة التذكيرات\n"
+        "/delreminder — حذف تذكير\n"
         "/add — إضافة مهمة جديدة\n"
         "/list — عرض كل المهام الدائمة\n"
         "/edit — تعديل مهمة\n"
@@ -142,7 +189,8 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update, cfg):
         return
     chat = update.effective_chat
-    assert chat is not None
+    if chat is None:
+        return
     await send_today_tasks(context.application, chat.id, cfg, notion)
 
 
@@ -153,9 +201,13 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     days = 30
+    clamped_note = ""
     if context.args:
         try:
-            days = max(1, min(365, int(context.args[0])))
+            raw_days = int(context.args[0])
+            days = max(1, min(365, raw_days))
+            if days != raw_days:
+                clamped_note = f"\n(تم تقليص العدد إلى {days} يوماً)"
         except ValueError:
             await update.message.reply_text("استخدم رقم أيام صحيح، مثال: /report 7")
             return
@@ -175,6 +227,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"⏳ بدون إجابة: {stats.pending}\n\n"
         f"نسبة الإنجاز من المهام المُجاب عليها: {completion}%\n"
         f"نسبة الإنجاز من كل السجلات: {total_completion}%"
+        f"{clamped_note}"
     )
 
 
@@ -224,10 +277,68 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    notion: NotionTasks = context.application.bot_data["notion"]
+    if not _authorized(update, cfg) or update.message is None:
+        return
+
+    today = _today(cfg)
+    entries = await notion.list_log_entries_for_date(today)
+
+    if not entries:
+        await update.message.reply_text("لا توجد مهام لليوم.")
+        return
+
+    done_entries = [e for e in entries if e.status == cfg.status_done]
+    missed_entries = [e for e in entries if e.status == cfg.status_missed]
+    pending_entries = [e for e in entries if e.status not in {cfg.status_done, cfg.status_missed}]
+
+    total = len(entries)
+    done_count = len(done_entries)
+    percent = (done_count / total * 100) if total else 0.0
+
+    day_name = day_label(today)
+    date_str = today.isoformat()
+
+    lines: list[str] = [f"📊 تقدم اليوم — {day_name} {date_str}\n"]
+
+    if done_entries:
+        lines.append(f"✅ تم ({len(done_entries)}):")
+        for e in done_entries:
+            lines.append(f"  • {e.title}")
+        lines.append("")
+
+    if missed_entries:
+        lines.append(f"❌ لم يتم ({len(missed_entries)}):")
+        for e in missed_entries:
+            lines.append(f"  • {e.title}")
+        lines.append("")
+
+    if pending_entries:
+        lines.append(f"⏳ لم يُجب عليه ({len(pending_entries)}):")
+        for e in pending_entries:
+            lines.append(f"  • {e.title}")
+        lines.append("")
+
+    lines.append(f"📈 الإنجاز: {done_count}/{total} ({percent:.0f}%)")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 # ──────────────────────────── /add ────────────────────────────
 
 ADD_NAME, ADD_TYPE, ADD_DAYS = range(3)
 TYPE_OPTIONS = ["Boolean", "Number", "Rating", "Text"]
+
+# ──────────────────────────── /reminder conversation states ────────────────────────────
+
+REM_TITLE = 30
+REM_TYPE = 31
+REM_DAYS = 32
+REM_DATE = 33
+REM_TIME = 34
+REM_REPEAT = 35
 
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -292,8 +403,8 @@ async def add_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ADD_DAYS
 
     notion: NotionTasks = context.application.bot_data["notion"]
-    name = context.user_data.pop("new_task_name", "")
-    chosen = context.user_data.pop("new_task_type", "Boolean")
+    name = context.user_data.get("new_task_name", "")
+    chosen = context.user_data.get("new_task_type", "Boolean")
 
     try:
         await notion.create_task(name=name, type_value=chosen, days=days)
@@ -302,8 +413,10 @@ async def add_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(
             f"⚠️ فشل: {exc}", reply_markup=ReplyKeyboardRemove()
         )
-        return ConversationHandler.END
+        return ADD_DAYS
 
+    context.user_data.pop("new_task_name", None)
+    context.user_data.pop("new_task_type", None)
     await update.message.reply_text(
         f"✅ أُضيفت: «{name}» ({chosen})\nالأيام: {format_days(days)}",
         reply_markup=ReplyKeyboardRemove(),
@@ -315,7 +428,7 @@ async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("new_task_name", None)
     context.user_data.pop("new_task_type", None)
     if update.message:
-        await update.message.reply_text("أُلغي.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("أُلغيت إضافة المهمة.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -455,7 +568,7 @@ async def edit_apply_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("الاسم فارغ.")
         return EDIT_NEW_NAME
     notion: NotionTasks = context.application.bot_data["notion"]
-    page_id = context.user_data.pop("edit_page_id", None)
+    page_id = context.user_data.get("edit_page_id")
     if not page_id:
         await update.message.reply_text("⚠️ خطأ داخلي. ابدأ من جديد بـ /edit.")
         return ConversationHandler.END
@@ -464,7 +577,8 @@ async def edit_apply_name(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as exc:
         log.exception("update_task name failed")
         await update.message.reply_text(f"⚠️ فشل: {exc}")
-        return ConversationHandler.END
+        return EDIT_NEW_NAME
+    context.user_data.pop("edit_page_id", None)
     await update.message.reply_text(f"✅ الاسم محدّث: «{new_name}»")
     return ConversationHandler.END
 
@@ -479,7 +593,7 @@ async def edit_apply_type(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return EDIT_NEW_TYPE
     notion: NotionTasks = context.application.bot_data["notion"]
-    page_id = context.user_data.pop("edit_page_id", None)
+    page_id = context.user_data.get("edit_page_id")
     if not page_id:
         await update.message.reply_text("⚠️ خطأ داخلي. ابدأ من جديد بـ /edit.")
         return ConversationHandler.END
@@ -488,7 +602,8 @@ async def edit_apply_type(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as exc:
         log.exception("update_task type failed")
         await update.message.reply_text(f"⚠️ فشل: {exc}")
-        return ConversationHandler.END
+        return EDIT_NEW_TYPE
+    context.user_data.pop("edit_page_id", None)
     await update.message.reply_text(
         f"✅ النوع محدّث: {new_type}", reply_markup=ReplyKeyboardRemove()
     )
@@ -505,7 +620,7 @@ async def edit_apply_days(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return EDIT_NEW_DAYS
 
     notion: NotionTasks = context.application.bot_data["notion"]
-    page_id = context.user_data.pop("edit_page_id", None)
+    page_id = context.user_data.get("edit_page_id")
     if not page_id:
         await update.message.reply_text("⚠️ خطأ داخلي. ابدأ من جديد بـ /edit.")
         return ConversationHandler.END
@@ -514,7 +629,8 @@ async def edit_apply_days(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as exc:
         log.exception("update_task days failed")
         await update.message.reply_text(f"⚠️ فشل: {exc}")
-        return ConversationHandler.END
+        return EDIT_NEW_DAYS
+    context.user_data.pop("edit_page_id", None)
     await update.message.reply_text(
         f"✅ الأيام محدّثة: {format_days(days)}",
         reply_markup=ReplyKeyboardRemove(),
@@ -525,8 +641,231 @@ async def edit_apply_days(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("edit_page_id", None)
     if update.message:
-        await update.message.reply_text("أُلغي.", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text("أُلغي تعديل المهمة.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+# ──────────────────────────── /reminder ConversationHandler ────────────────────────────
+
+
+async def cmd_reminder_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _authorized(update, cfg) or update.message is None:
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "📌 أدخل نص التذكير:\n(اكتب /cancel للإلغاء)",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return REM_TITLE
+
+
+async def rem_receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.message.text is None:
+        return REM_TITLE
+    title = update.message.text.strip()
+    if not title:
+        await update.message.reply_text("النص فارغ. أدخل نص التذكير:")
+        return REM_TITLE
+    context.user_data["rem_title"] = title
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("كل يوم", callback_data="rem_type:daily"),
+            InlineKeyboardButton("أيام محددة", callback_data="rem_type:weekly"),
+            InlineKeyboardButton("تاريخ محدد", callback_data="rem_type:once"),
+        ]
+    ])
+    await update.message.reply_text("🗓️ متى تريد التذكير؟", reply_markup=keyboard)
+    return REM_TYPE
+
+
+async def rem_receive_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if query is None or query.data is None:
+        return REM_TYPE
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "daily":
+        context.user_data["rem_days"] = []
+        context.user_data["rem_dates"] = []
+        if query.message:
+            await query.message.reply_text("🕐 أدخل وقت التذكير (مثال: 09:00):")
+        return REM_TIME
+    elif choice == "weekly":
+        if query.message:
+            await query.message.reply_text(
+                "أدخل الأيام (مثال: الاثنين، الأربعاء، الجمعة):"
+            )
+        return REM_DAYS
+    else:  # once
+        if query.message:
+            await query.message.reply_text("أدخل التاريخ (مثال: 2026-07-15):")
+        return REM_DATE
+
+
+async def rem_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.message.text is None:
+        return REM_DAYS
+    try:
+        day_names = parse_days(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(f"{exc}\nجرّب: الاثنين، الأربعاء، الجمعة")
+        return REM_DAYS
+    # Convert Arabic day names to weekday numbers using DAY_LABELS index
+    day_nums = [DAY_LABELS.index(name) for name in day_names if name in DAY_LABELS]
+    context.user_data["rem_days"] = day_nums
+    context.user_data["rem_dates"] = []
+    await update.message.reply_text("🕐 أدخل وقت التذكير (مثال: 09:00):")
+    return REM_TIME
+
+
+async def rem_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.message.text is None:
+        return REM_DATE
+    text = update.message.text.strip()
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        await update.message.reply_text("تنسيق التاريخ غير صحيح. مثال: 2026-07-15")
+        return REM_DATE
+    context.user_data["rem_dates"] = [text]
+    context.user_data["rem_days"] = []
+    await update.message.reply_text("🕐 أدخل وقت التذكير (مثال: 09:00):")
+    return REM_TIME
+
+
+async def rem_receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.message.text is None:
+        return REM_TIME
+    text = update.message.text.strip()
+    try:
+        hour_str, minute_str = text.split(":")
+        hour = int(hour_str)
+        minute = int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("تنسيق الوقت غير صحيح. مثال: 09:00")
+        return REM_TIME
+    context.user_data["rem_hour"] = hour
+    context.user_data["rem_minute"] = minute
+    await update.message.reply_text("🔁 كم مرة تكرار؟ (أدخل رقم، أو 0 لغير محدد):")
+    return REM_REPEAT
+
+
+async def rem_receive_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message is None or update.message.text is None:
+        return REM_REPEAT
+    text = update.message.text.strip()
+    try:
+        repeat_count = int(text)
+        if repeat_count < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("أدخل رقماً صحيحاً (0 = غير محدد):")
+        return REM_REPEAT
+
+    store: RemindersStore = context.application.bot_data["reminders_store"]
+    r = Reminder(
+        title=context.user_data.get("rem_title", ""),
+        days_of_week=context.user_data.get("rem_days", []),
+        specific_dates=context.user_data.get("rem_dates", []),
+        notify_hour=context.user_data.get("rem_hour", 9),
+        notify_minute=context.user_data.get("rem_minute", 0),
+        repeat_count=repeat_count,
+    )
+    store.add(r)
+
+    # Build summary
+    hour = r.notify_hour
+    minute = r.notify_minute
+    if r.specific_dates:
+        schedule = f"في {', '.join(r.specific_dates)}"
+    elif r.days_of_week:
+        day_names = "، ".join(DAY_LABELS[d] for d in r.days_of_week)
+        schedule = day_names
+    else:
+        schedule = "كل يوم"
+    repeat_label = "غير محدد" if repeat_count == 0 else f"{repeat_count} مرة"
+
+    await update.message.reply_text(
+        f"✅ تم إضافة التذكير:\n\n"
+        f"📌 {r.title}\n"
+        f"🕐 {hour:02d}:{minute:02d} | {schedule}\n"
+        f"🔁 {repeat_label}"
+    )
+
+    for key in ("rem_title", "rem_days", "rem_dates", "rem_hour", "rem_minute"):
+        context.user_data.pop(key, None)
+
+    return ConversationHandler.END
+
+
+async def rem_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    for key in ("rem_title", "rem_days", "rem_dates", "rem_hour", "rem_minute"):
+        context.user_data.pop(key, None)
+    if update.message:
+        await update.message.reply_text("أُلغيت إضافة التذكير.")
+    return ConversationHandler.END
+
+
+# ──────────────────────────── /reminders & /delreminder ────────────────────────────
+
+
+def _format_reminder_list(reminders: list[Reminder]) -> str:
+    if not reminders:
+        return "لا توجد تذكيرات."
+    lines = ["📋 تذكيراتك:"]
+    for i, r in enumerate(reminders, 1):
+        if r.specific_dates:
+            schedule = "، ".join(r.specific_dates)
+        elif r.days_of_week:
+            schedule = "، ".join(DAY_LABELS[d] for d in r.days_of_week)
+        else:
+            schedule = "كل يوم"
+        repeat_label = "غير محدد" if r.repeat_count == 0 else f"{r.repeat_count} مرة"
+        lines.append(
+            f"{i}. {r.title}\n"
+            f"   🕐 {r.notify_hour:02d}:{r.notify_minute:02d} | {schedule}\n"
+            f"   🔁 {repeat_label} | تم الإرسال {r.fired_count} مرة"
+        )
+    return "\n".join(lines)
+
+
+async def cmd_list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _authorized(update, cfg) or update.message is None:
+        return
+    store: RemindersStore = context.application.bot_data["reminders_store"]
+    await update.message.reply_text(_format_reminder_list(store.all()))
+
+
+async def cmd_del_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _authorized(update, cfg) or update.message is None:
+        return
+    store: RemindersStore = context.application.bot_data["reminders_store"]
+
+    if not context.args:
+        text = _format_reminder_list(store.all())
+        if store.all():
+            text += "\n\nاستخدم /delreminder <رقم>"
+        await update.message.reply_text(text)
+        return
+
+    try:
+        index = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("أدخل رقم التذكير. مثال: /delreminder 1")
+        return
+
+    reminders = store.all()
+    if index < 1 or index > len(reminders):
+        await update.message.reply_text("لا يوجد تذكير بهذا الرقم.")
+        return
+
+    target = reminders[index - 1]
+    store.delete(target.id)
+    await update.message.reply_text(f"🗑 تم حذف التذكير: {target.title}")
 
 
 # ──────────────────────────── daily question callbacks ────────────────────────────
@@ -537,7 +876,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     query = update.callback_query
     if query is None or query.data is None:
         return
-    if query.data.startswith((f"{CB_DELETE}:", f"{CB_EDIT}:")):
+    if query.data.startswith((f"{CB_DELETE}:", f"{CB_EDIT}:", "rem_type:")):
         return  # routed elsewhere
 
     chat = update.effective_chat
@@ -561,16 +900,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     original = query.message.text if query.message else ""
 
+    await query.answer("جارٍ المعالجة…")
+
+    ctx = _ctx(context.application, chat.id)
+    if query.message:
+        ctx.original_message_id = query.message.message_id
     try:
         new_text = await answer_type.on_button(
-            action, page_id, original, _ctx(context.application, chat.id)
+            action, page_id, original, ctx
         )
     except Exception as exc:
         log.exception("Callback failed")
-        await query.answer(f"فشل: {exc}", show_alert=True)
+        try:
+            await query.message.reply_text(f"⚠️ فشل: {exc}") if query.message else None
+        except Exception:
+            pass
         return
 
-    await query.answer("تم ✅" if new_text else "")
     if new_text is not None:
         try:
             await query.edit_message_text(text=new_text, reply_markup=None)
@@ -593,6 +939,7 @@ async def on_text_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     pending = _pending(context.application)
+    _clean_pending(pending)
     key = (chat.id, msg.reply_to_message.message_id)
     entry = pending.get(key)
     if entry is None:
@@ -647,15 +994,34 @@ def register(app: Application) -> None:
         per_message=False,
     )
 
+    reminder_conv = ConversationHandler(
+        entry_points=[CommandHandler("reminder", cmd_reminder_start)],
+        states={
+            REM_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_receive_title)],
+            REM_TYPE: [CallbackQueryHandler(rem_receive_type, pattern=r"^rem_type:")],
+            REM_DAYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_receive_days)],
+            REM_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_receive_date)],
+            REM_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_receive_time)],
+            REM_REPEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, rem_receive_repeat)],
+        },
+        fallbacks=[CommandHandler("cancel", rem_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("progress", cmd_progress))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("edit", cmd_edit))
+    app.add_handler(CommandHandler("reminders", cmd_list_reminders))
+    app.add_handler(CommandHandler("delreminder", cmd_del_reminder))
     app.add_handler(add_conv)
     app.add_handler(edit_conv)
+    app.add_handler(reminder_conv)
     app.add_handler(CallbackQueryHandler(on_delete_callback, pattern=f"^{CB_DELETE}:"))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(
