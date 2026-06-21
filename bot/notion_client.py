@@ -146,6 +146,8 @@ class NotionTasks:
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
+            if not cursor:
+                break  # has_more=true but no cursor — defensive stop
         return results
 
     async def list_tasks_for_date(self, target_date: date) -> list[Task]:
@@ -210,6 +212,8 @@ class NotionTasks:
             },
             cfg.notion_date_property: {"date": {"start": today.isoformat()}},
         }
+        if task.type_value:
+            props[cfg.notion_type_property] = {"select": {"name": task.type_value}}
         resp = await self.client.pages.create(
             parent={"database_id": cfg.notion_log_database_id},
             properties=props,
@@ -252,12 +256,26 @@ class NotionTasks:
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
+            if not cursor:
+                break  # has_more=true but no cursor — defensive stop
         return results
 
     async def ensure_log_entries_for_date(self, target_date: date) -> list[LogEntry]:
         tasks = await self.list_tasks_for_date(target_date)
         existing = await self.list_log_entries_for_date(target_date)
-        by_title = {entry.title: entry for entry in existing}
+        by_title: dict[str, LogEntry] = {}
+        for entry in existing:
+            if entry.title in by_title:
+                log.warning(
+                    "Duplicate log entry title %r for date %s (page_ids %s and %s) — "
+                    "keeping the first; consider giving tasks unique titles",
+                    entry.title,
+                    target_date,
+                    by_title[entry.title].page_id,
+                    entry.page_id,
+                )
+            else:
+                by_title[entry.title] = entry
         entries: list[LogEntry] = []
         for task in tasks:
             current = by_title.get(task.title)
@@ -289,6 +307,8 @@ class NotionTasks:
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
+            if not cursor:
+                break  # has_more=true but no cursor — defensive stop
         return count
 
     async def report_stats(self, days: int = 30, today: date | None = None) -> ReportStats:
@@ -328,6 +348,8 @@ class NotionTasks:
             if not resp.get("has_more"):
                 break
             cursor = resp.get("next_cursor")
+            if not cursor:
+                break  # has_more=true but no cursor — defensive stop
         return stats
 
     # ───────── log row updates ─────────

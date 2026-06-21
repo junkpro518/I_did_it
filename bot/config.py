@@ -1,3 +1,4 @@
+import logging as _logging
 import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -62,13 +63,17 @@ class Config:
     morning_minute: int
     reminder_hours: list[int]
     reminder_minute: int
+    reminders_file: str
+
+
+_log = _logging.getLogger(__name__)
 
 
 def load_config() -> Config:
     chat_id_raw = os.getenv("TELEGRAM_CHAT_ID")
     chat_id = int(chat_id_raw) if chat_id_raw else None
 
-    return Config(
+    cfg = Config(
         telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=chat_id,
         notion_token=_required("NOTION_TOKEN"),
@@ -97,4 +102,15 @@ def load_config() -> Config:
         morning_minute=_int("MORNING_MINUTE", _int("DAILY_MINUTE", 0)),
         reminder_hours=_int_list("REMINDER_HOURS", [16, 23]),
         reminder_minute=_int("REMINDER_MINUTE", 0),
+        reminders_file=os.getenv("REMINDERS_FILE", "data/reminders.json"),
     )
+
+    if cfg.telegram_chat_id is None:
+        _log.error(
+            "TELEGRAM_CHAT_ID is not set — scheduled reminders will not fire. "
+            "To find your chat ID, send any message to your bot and check "
+            "https://api.telegram.org/bot<TOKEN>/getUpdates, then set "
+            "TELEGRAM_CHAT_ID=<id> in your environment."
+        )
+
+    return cfg

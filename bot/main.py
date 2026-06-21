@@ -8,16 +8,22 @@ from telegram.ext import Application
 from .config import load_config
 from .handlers import register
 from .notion_client import NotionTasks
+from .reminders import RemindersStore
 from .scheduler import setup_scheduler
 
 BOT_COMMANDS = [
     BotCommand("tasks", "مراجعة مهام اليوم الآن"),
+    BotCommand("progress", "تقدم مهام اليوم"),
     BotCommand("report", "تقرير التقدم والإحصائيات"),
     BotCommand("add", "إضافة مهمة جديدة"),
     BotCommand("list", "عرض كل المهام الدائمة"),
     BotCommand("edit", "تعديل مهمة"),
     BotCommand("delete", "حذف مهمة"),
+    BotCommand("reminder", "إضافة تذكير"),
+    BotCommand("reminders", "قائمة التذكيرات"),
+    BotCommand("delreminder", "حذف تذكير"),
     BotCommand("health", "حالة البوت و Notion"),
+    BotCommand("help", "عرض قائمة الأوامر"),
     BotCommand("start", "ترحيب وعرض Chat ID"),
 ]
 
@@ -71,6 +77,7 @@ def main() -> None:
     )
     app.bot_data["cfg"] = cfg
     app.bot_data["notion"] = notion
+    app.bot_data["reminders_store"] = RemindersStore(cfg.reminders_file)
     register(app)
 
     log.info("Starting Telegram bot (long polling)…")
