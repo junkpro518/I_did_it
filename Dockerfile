@@ -16,6 +16,6 @@ RUN useradd --create-home --uid 1000 botuser
 USER botuser
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD pgrep -f "python.*main" > /dev/null || exit 1
+    CMD python -c "import pathlib, sys; sys.exit(0 if pathlib.Path('/proc/1/cmdline').read_bytes().replace(b'\0', b' ').startswith(b'python -m bot.main') else 1)"
 
 CMD ["python", "-m", "bot.main"]
