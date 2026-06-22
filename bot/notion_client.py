@@ -212,7 +212,7 @@ class NotionTasks:
             },
             cfg.notion_date_property: {"date": {"start": today.isoformat()}},
         }
-        if task.type_value:
+        if task.type_value and await self.has_log_property(cfg.notion_type_property):
             props[cfg.notion_type_property] = {"select": {"name": task.type_value}}
         resp = await self.client.pages.create(
             parent={"database_id": cfg.notion_log_database_id},
